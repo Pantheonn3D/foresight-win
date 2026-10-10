@@ -70,6 +70,7 @@ class Track:
         self.segmenter = Segmenter()
         self.written = 0  # 16 kHz samples emitted so far
         self.level = 0.0  # recent peak, 0..1, for the UI meter
+        self.last_audio = time.monotonic()  # when the device last delivered a buffer
         self.q: queue.Queue[tuple[float, bytes] | None] = queue.Queue()
         self._writer = None
         if save_to is not None:
@@ -79,7 +80,15 @@ class Track:
         self._thread.start()
 
     def push(self, raw: bytes, now: float | None = None) -> None:
-        self.q.put((time.monotonic() if now is None else now, raw))
+        now = time.monotonic() if now is None else now
+        self.last_audio = now
+        self.q.put((now, raw))
+
+    def meter(self) -> float:
+        """Peak level, decayed by time since the last buffer: loopback sends nothing during
+        silence, so a meter that only decays on new audio would freeze at its last peak."""
+        idle = time.monotonic() - self.last_audio
+        return self.level * (0.5 ** (idle / 0.15)) if idle > 0.1 else self.level
 
     def close(self) -> None:
         self.q.put(None)
@@ -103,7 +112,8 @@ class Track:
         if self.fill_gaps:
             expected = int((when - self.t0) * SR) - len(y)
             gap = expected - self.written
-            if gap > int(0.1 * SR):
+            # 0.25 s: well above callback jitter (50 ms buffers), well below a real loopback silence
+            if gap > int(0.25 * SR):
                 self._emit(np.zeros(gap, dtype=np.float32))
         self._emit(y)
 
@@ -126,10 +136,27 @@ class Track:
                 self._writer.close()
 
 
+def _find(pa, name: str | None, kind: str) -> dict | None:
+    """WASAPI device by name. PortAudio renumbers devices whenever one is plugged in or
+    removed, so settings store names and resolve them at each recording start."""
+    if not name:
+        return None
+    import pyaudiowpatch as pyaudio
+
+    wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+    channels = "maxInputChannels" if kind == "input" else "maxOutputChannels"
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        if d["hostApi"] == wasapi and not d.get("isLoopbackDevice") and d["name"] == name and d[channels] > 0:
+            return d
+    log.warning("%s device %r not found; using the Windows default", kind, name)
+    return None
+
+
 class Recorder:
     """Owns the PortAudio streams for one recording session."""
 
-    def __init__(self, on_segment: SegmentFn, folder: Path | None, mic: int | None, speaker: int | None,
+    def __init__(self, on_segment: SegmentFn, folder: Path | None, mic: str | None, speaker: str | None,
                  system_audio: bool):
         import pyaudiowpatch as pyaudio
 
@@ -139,13 +166,11 @@ class Recorder:
         self.t0 = time.monotonic()
         self.paused = False
         try:
-            mic_info = (self.pa.get_device_info_by_index(mic) if mic is not None
-                        else self.pa.get_default_wasapi_device(d_in=True))
+            mic_info = _find(self.pa, mic, "input") or self.pa.get_default_wasapi_device(d_in=True)
             # both tracks fill gaps so pauses and dropped callbacks keep them on one timeline
             self._open("mic", mic_info, on_segment, folder, fill_gaps=True)
             if system_audio:
-                out_info = (self.pa.get_device_info_by_index(speaker) if speaker is not None
-                            else self.pa.get_default_wasapi_device(d_out=True))
+                out_info = _find(self.pa, speaker, "output") or self.pa.get_default_wasapi_device(d_out=True)
                 loop_info = self.pa.get_wasapi_loopback_analogue_by_dict(out_info)
                 self._open("system", loop_info, on_segment, folder, fill_gaps=True)
         except Exception:
@@ -162,7 +187,9 @@ class Recorder:
         self.tracks[name] = track
 
         def callback(data, frames, time_info, status):
-            if not self.paused:
+            if self.paused:
+                track.last_audio = time.monotonic()  # paused is not stalled
+            else:
                 track.push(data)
             return (None, pyaudio.paContinue)
 
@@ -173,7 +200,20 @@ class Recorder:
         log.info("capturing %s from %r at %d Hz x%d", name, info["name"], rate, channels)
 
     def levels(self) -> dict[str, float]:
-        return {k: round(t.level, 3) for k, t in self.tracks.items()}
+        return {k: round(t.meter(), 3) for k, t in self.tracks.items()}
+
+    def stalled(self, name: str, seconds: float) -> bool:
+        """A device that was unplugged or lost its Bluetooth link stops calling back."""
+        t = self.tracks.get(name)
+        if t is None:
+            return False
+        stream = self.streams[list(self.tracks).index(name)] if len(self.streams) == len(self.tracks) else None
+        try:
+            if stream is not None and not stream.is_active():
+                return True
+        except OSError:
+            return True
+        return time.monotonic() - t.last_audio > seconds
 
     def stop(self) -> None:
         for s in self.streams:

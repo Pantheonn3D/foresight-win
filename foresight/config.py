@@ -67,8 +67,9 @@ class Settings:
     # "auto" picks cuda when an NVIDIA GPU is present, otherwise vulkan
     backend: str = "auto"
     ctx_size: int = 65536
-    mic_device: int | None = None  # PortAudio index; None = Windows default input
-    speaker_device: int | None = None  # output device whose loopback is captured; None = default
+    # device names, not PortAudio indexes (those shift when devices are plugged in); None = Windows default
+    mic_device: str | None = None
+    speaker_device: str | None = None  # output device whose loopback is captured
     capture_system_audio: bool = True
     # With speakers (no headphones) the mic hears the other side too; we then drop
     # mic lines that duplicate what the system-audio channel already transcribed.
@@ -87,7 +88,11 @@ class Settings:
         except (OSError, json.JSONDecodeError):
             return cls()
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in raw.items() if k in known})
+        data = {k: v for k, v in raw.items() if k in known}
+        for k in ("mic_device", "speaker_device"):
+            if not isinstance(data.get(k), (str, type(None))):
+                data[k] = None  # settings from before devices were stored by name
+        return cls(**data)
 
     def save(self) -> None:
         path = data_dir() / "settings.json"

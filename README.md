@@ -38,7 +38,7 @@ Everything lives in `%LOCALAPPDATA%\Foresight`: models, the llama.cpp build, `fo
 
 ## Privacy
 
-After setup, Foresight makes no network requests. Its two llama.cpp servers listen only on `127.0.0.1`, and the UI is served from `127.0.0.1:47821`. WebView2 is Microsoft's component and has its own update service, so verify it yourself if you need certainty, for example with Windows Firewall rules or Wireshark. Recording other people may require their consent where you live, so tell people before you record.
+After setup, Foresight makes no network requests. Its two llama.cpp servers listen only on `127.0.0.1`, and the UI is served from `127.0.0.1:47821`. Other web pages open in your browser can't use that local API: state-changing requests need a header that cross-site pages can't send, unknown host names are rejected (DNS rebinding), and the live-transcript WebSocket only accepts the app's own page. WebView2 is Microsoft's component and has its own update service, so verify it yourself if you need certainty, for example with Windows Firewall rules or Wireshark. Recording other people may require their consent where you live, so tell people before you record.
 
 ## Known limitations
 

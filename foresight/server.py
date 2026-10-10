@@ -13,9 +13,10 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import Body, FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Body, FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import config, kb, llama, models, notes, session
 from .db import DB
@@ -23,6 +24,12 @@ from .events import bus
 
 log = logging.getLogger(__name__)
 WEB = Path(__file__).parent / "web"
+# Any browser tab on this PC can send requests to 127.0.0.1. A custom header can't be
+# added cross-site without a CORS preflight, which this server never approves, so
+# requiring it on every state-changing request keeps other pages from starting the
+# mic or deleting meetings. The page's own fetches send it (web/app.js).
+CSRF_HEADER = "x-foresight"
+MIC_STALL_SECONDS = 4.0
 
 
 class App:
@@ -34,6 +41,10 @@ class App:
         self.setup_cancel: threading.Event | None = None
         self.setup_state: dict = {"running": False}
         self.runtime_state = {"llm": "stopped", "embed": "stopped", "error": None}
+        self.setup_lock = threading.Lock()
+        self.mic_warned = False
+        # the runtime reports every start, crash and restart, including ones triggered mid-meeting
+        llama.runtime.on_state = self._on_runtime
 
     # --- runtime warm-up ---------------------------------------------------
 
@@ -41,47 +52,65 @@ class App:
         def work():
             s = config.settings()
             if llama.runtime_installed() and models.is_installed(s.llm):
-                self._set_runtime(llm="starting")
                 try:
                     llama.runtime.ensure_llm()
-                    self._set_runtime(llm="ready")
-                except Exception as e:
+                except Exception:
                     log.exception("llm start failed")
-                    self._set_runtime(llm="error", error=str(e))
             if llama.runtime_installed() and kb.available():
-                self._set_runtime(embed="starting")
                 try:
                     llama.runtime.ensure_embedder()
-                    self._set_runtime(embed="ready")
                     self.index.scan()
-                except Exception as e:
+                except Exception:
                     log.exception("embedder start failed")
-                    self._set_runtime(embed="error", error=str(e))
 
         threading.Thread(target=work, name="warm", daemon=True).start()
 
-    def _set_runtime(self, **kw) -> None:
-        self.runtime_state.update(kw)
+    def _on_runtime(self, kind: str, state: str, error: str | None = None) -> None:
+        self.runtime_state[kind] = state
+        if state == "error":
+            self.runtime_state["error"] = error
+        elif state == "ready" and all(self.runtime_state[k] != "error" for k in ("llm", "embed")):
+            self.runtime_state["error"] = None
         bus.publish("runtime", **self.runtime_state)
+
+    def shutdown(self, transcribe_timeout: float = 30.0) -> None:
+        """Called when the window closes: finalise audio files and the meeting row first,
+        then give queued segments a bounded time to transcribe, then stop the models."""
+        with self.rec_lock:
+            r, self.recording = self.recording, None
+        if r is not None:
+            try:
+                r.stop(transcribe_timeout=transcribe_timeout)
+            except Exception:
+                log.exception("stopping the recording on exit failed")
+        llama.runtime.stop()
 
     # --- setup -------------------------------------------------------------
 
     def start_setup(self, keys: list[str]) -> None:
-        if self.setup_state.get("running"):
-            raise HTTPException(409, "Setup is already running")
         bad = [k for k in keys if k not in models.CATALOG]
         if bad:
             raise HTTPException(400, f"Unknown models: {', '.join(bad)}")
+        with self.setup_lock:
+            if self.setup_state.get("running"):
+                raise HTTPException(409, "Setup is already running")
+            self.setup_state = {"running": True, "step": 0, "steps": 0}
         self.setup_cancel = threading.Event()
         cancel = self.setup_cancel
         steps = ([("runtime", f"llama.cpp {llama.LLAMA_CPP_TAG} ({llama.backend().upper()})")]
                  if not llama.runtime_installed() else [])
         steps += [(k, models.CATALOG[k].label) for k in keys if not models.is_installed(k)]
 
+        last = [0.0]
+
         def report(i, key, label, done, total):
             self.setup_state = {"running": True, "step": i + 1, "steps": len(steps), "key": key, "label": label,
                                 "done": done, "total": total}
-            bus.publish("setup", **self.setup_state)
+            # downloads report every MiB; the UI only needs a few updates a second
+            now = time.monotonic()
+            if now - last[0] >= 0.25 or done == 0 or done == total:
+                last[0] = now
+                bus.publish("setup", **self.setup_state)
 
         def work():
             try:
@@ -104,12 +133,27 @@ class App:
         self.setup_state = {"running": True, "step": 0, "steps": len(steps)}
         threading.Thread(target=work, name="setup", daemon=True).start()
 
+    def check_mic(self) -> None:
+        """Bluetooth headsets dying or USB mics being pulled stop the callbacks silently."""
+        r = self.recording
+        if r is None or r.paused:
+            self.mic_warned = False
+            return
+        stalled = r.recorder.stalled("mic", MIC_STALL_SECONDS)
+        if stalled and not self.mic_warned:
+            self.mic_warned = True
+            bus.publish("error", meeting_id=r.meeting_id, where="microphone",
+                        message="No audio from the microphone for a few seconds. If it was unplugged or ran out "
+                                "of battery, stop and start the recording to switch devices.")
+        elif not stalled:
+            self.mic_warned = False
+
     def state(self) -> dict:
         s = config.settings()
         rec = None
-        if self.recording:
-            rec = {"meeting_id": self.recording.meeting_id, "paused": self.recording.paused,
-                   "elapsed": time.monotonic() - self.recording.started}
+        r = self.recording  # stop() can clear it concurrently
+        if r is not None:
+            rec = {"meeting_id": r.meeting_id, "paused": r.paused, "elapsed": time.monotonic() - r.started}
         return {
             "setup": {
                 "runtime_installed": llama.runtime_installed(),
@@ -142,16 +186,23 @@ def create_app() -> FastAPI:
                 if r is not None:
                     bus.publish("levels", levels=r.recorder.levels(),
                                 elapsed=round(time.monotonic() - r.started, 1))
+                    app.check_mic()
 
         task = asyncio.create_task(levels())
         yield
         task.cancel()
-        if app.recording:
-            await asyncio.to_thread(app.recording.stop)
-        llama.runtime.stop()
+        await asyncio.to_thread(app.shutdown)
 
     api = FastAPI(title="Foresight", lifespan=lifespan)
     api.state.core = app
+    # blocks DNS-rebinding pages, which reach 127.0.0.1 under their own host name
+    api.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
+
+    @api.middleware("http")
+    async def require_app_header(request: Request, call_next):
+        if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get(CSRF_HEADER) != "1":
+            return JSONResponse({"detail": "Missing app header"}, status_code=403)
+        return await call_next(request)
 
     @api.get("/api/state")
     def get_state():
@@ -195,9 +246,7 @@ def create_app() -> FastAPI:
         except (KeyError, TypeError) as e:
             raise HTTPException(400, str(e))
         if new.llm != old.llm or new.ctx_size != old.ctx_size or new.backend != old.backend:
-            if llama.runtime.llm:
-                llama.runtime.llm.stop()
-            app._set_runtime(llm="stopped")
+            llama.runtime.stop_llm()
             app.warm()
         if new.folders != old.folders:
             threading.Thread(target=app.index.scan, daemon=True).start()
@@ -237,8 +286,11 @@ def create_app() -> FastAPI:
 
     @api.delete("/api/meetings/{mid}")
     def delete_meeting(mid: str):
-        if app.recording and app.recording.meeting_id == mid:
+        r = app.recording
+        if r is not None and r.meeting_id == mid:
             raise HTTPException(409, "Stop the recording first")
+        if session.transcribing(mid):
+            raise HTTPException(409, "This meeting is still being transcribed. Delete it when that finishes.")
         app.db.delete_meeting(mid)
         shutil.rmtree(config.meetings_dir() / mid, ignore_errors=True)
         return {"ok": True}
@@ -255,7 +307,7 @@ def create_app() -> FastAPI:
         def gen():
             out = []
             try:
-                for tok in notes.enhance(m["notes"], lines, m["title"]):
+                for tok in notes.enhance(m["notes"], lines, m["title"], m["language"]):
                     out.append(tok)
                     yield tok
             except Exception as e:
@@ -286,10 +338,12 @@ def create_app() -> FastAPI:
 
     @api.post("/api/recording/pause")
     def rec_pause(paused: bool = Body(..., embed=True)):
-        if not app.recording:
-            raise HTTPException(409, "Not recording")
-        app.recording.set_paused(paused)
-        bus.publish("recording", meeting_id=app.recording.meeting_id, state="paused" if paused else "recording")
+        with app.rec_lock:
+            r = app.recording
+            if r is None:
+                raise HTTPException(409, "Not recording")
+            r.set_paused(paused)
+        bus.publish("recording", meeting_id=r.meeting_id, state="paused" if paused else "recording")
         return {"ok": True}
 
     @api.post("/api/recording/stop")
@@ -367,6 +421,12 @@ def create_app() -> FastAPI:
 
     @api.websocket("/api/events")
     async def events(ws: WebSocket):
+        # WebSockets bypass CORS, so check who is connecting: only the app's own page
+        origin = ws.headers.get("origin")
+        host = ws.headers.get("host", "")
+        if origin not in (f"http://{host}", None) or host.split(":")[0] not in ("127.0.0.1", "localhost", "testserver"):
+            await ws.close(code=1008)
+            return
         await ws.accept()
         q = bus.subscribe()
         try:

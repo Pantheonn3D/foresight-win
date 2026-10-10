@@ -7,11 +7,16 @@ from typing import Iterator
 from . import config
 from .llama import runtime
 
-# Rough chars-per-token for mixed English/Danish speech; only used to decide
-# whether the transcript needs condensing before it fits a context slot.
-CHARS_PER_TOKEN = 3.5
+# Only used to decide whether a transcript needs condensing to fit a 32k-token context
+# slot. European languages average ~3.5 characters per Gemma token; Chinese, Japanese
+# and Korean are close to 1, so their limits in characters are much lower.
 DIRECT_LIMIT_TOKENS = 20000
-CONDENSE_CHUNK_CHARS = 40000
+CONDENSE_CHUNK_TOKENS = 12000
+CJK = {"Chinese", "Japanese", "Korean"}
+
+
+def chars_per_token(language: str | None) -> float:
+    return 1.0 if language in CJK else 3.5
 
 
 def fmt_time(seconds: float) -> str:
@@ -38,11 +43,12 @@ SYSTEM = (
 )
 
 
-def _condense(transcript: str) -> str:
+def _condense(transcript: str, language: str | None) -> str:
     """Summarise long transcripts chunk by chunk so the final pass fits one context slot."""
     parts = []
-    for i in range(0, len(transcript), CONDENSE_CHUNK_CHARS):
-        chunk = transcript[i:i + CONDENSE_CHUNK_CHARS]
+    size = int(CONDENSE_CHUNK_TOKENS * chars_per_token(language))
+    for i in range(0, len(transcript), size):
+        chunk = transcript[i:i + size]
         msgs = [{"role": "system", "content": "Condense this meeting transcript section into dense, factual "
                                               "bullet points with timestamps. Keep every number, name, date, "
                                               "decision and commitment. No commentary."},
@@ -51,12 +57,12 @@ def _condense(transcript: str) -> str:
     return "\n".join(parts)
 
 
-def enhance(notes: str, lines: list[dict], title: str) -> Iterator[str]:
+def enhance(notes: str, lines: list[dict], title: str, language: str | None = None) -> Iterator[str]:
     transcript = transcript_text(lines)
     if not transcript.strip():
         raise ValueError("There is no transcript yet, so there is nothing to expand the notes with.")
-    if len(transcript) / CHARS_PER_TOKEN > DIRECT_LIMIT_TOKENS:
-        transcript = "(Condensed from a long transcript)\n" + _condense(transcript)
+    if len(transcript) / chars_per_token(language) > DIRECT_LIMIT_TOKENS:
+        transcript = "(Condensed from a long transcript)\n" + _condense(transcript, language)
     name = config.settings().your_name or "You"
     user = (f"Meeting: {title}\n\n## My notes\n{notes.strip() or '(none — write the notes from the transcript)'}"
             f"\n\n## Transcript\n{transcript}")

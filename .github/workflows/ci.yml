@@ -21,6 +21,17 @@ jobs:
       - run: uv sync
       - run: uv run pytest -q
 
+  # The real page in Chromium against the demo backend: settings, delete dialog,
+  # streaming answers, live WebSocket events, autosave, at desktop and phone widths.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv pip install playwright && uv run playwright install --with-deps chromium
+      - run: uv run python -u scripts/ui_smoke.py
+
   build:
     needs: test
     runs-on: windows-latest

@@ -33,8 +33,8 @@ installed = not args.setup
 llama.runtime_installed = lambda: installed
 llama.backend = lambda: "cuda"
 models.is_installed = lambda key: installed
-models.remote_size = lambda key: {"gemma-4-e4b": 8_960_000_000, "gemma-4-e2b": 5_210_000_000,
-                                  "embeddinggemma-2": 1_180_000_000}[key]
+models.remote_size = lambda key: {"gemma-4-e4b": 8_960_000_000, "gemma-4-e2b": 5_950_000_000,
+                                  "embeddinggemma-2": 310_000_000}[key]
 models.resolve = lambda key: {}
 llama.runtime_download_size = lambda: 1_037_000_000
 kb.available = lambda: installed
@@ -120,6 +120,9 @@ def seed(app: server.App) -> None:
                 FakeRecorder.t += 0.1
                 import math
                 return {"mic": round(0.25 + 0.2 * math.sin(self.t * 3), 3), "system": 0.04}
+
+            def stalled(self, name, seconds):
+                return False
 
         class FakeRecording:
             meeting_id = live

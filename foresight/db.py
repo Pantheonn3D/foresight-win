@@ -58,8 +58,10 @@ class DB:
         self.conn.executescript(SCHEMA)
         self.lock = threading.RLock()
         # recover meetings left "recording" by a crash or forced quit
-        self.conn.execute("UPDATE meetings SET status='done', ended_at=COALESCE(ended_at, started_at) "
-                          "WHERE status IN ('recording','importing')")
+        # (end time from the last transcribed line, so the meeting doesn't show as 0 minutes)
+        self.conn.execute("""UPDATE meetings SET status='done', ended_at=COALESCE(ended_at, started_at +
+                                 COALESCE((SELECT max(end) FROM lines WHERE lines.meeting_id = meetings.id), 0))
+                             WHERE status IN ('recording','importing')""")
         self.conn.commit()
 
     def _q(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:

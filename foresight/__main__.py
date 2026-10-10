@@ -33,30 +33,32 @@ def port_taken(port: int) -> bool:
     return False
 
 
-def serve(port: int) -> "uvicorn.Server":  # noqa: F821
+def serve(port: int):
     import uvicorn
 
     from .server import create_app
 
-    server = uvicorn.Server(uvicorn.Config(create_app(), host="127.0.0.1", port=port, log_level="warning",
-                                          log_config=None))
-    threading.Thread(target=server.run, name="uvicorn", daemon=True).start()
+    api = create_app()
+    server = uvicorn.Server(uvicorn.Config(api, host="127.0.0.1", port=port, log_level="warning", log_config=None))
+    thread = threading.Thread(target=server.run, name="uvicorn", daemon=True)
+    thread.start()
     deadline = time.monotonic() + 30
     while not server.started and time.monotonic() < deadline:
         time.sleep(0.05)
-    return server
+    return server, thread, api.state.core
 
 
 class JsApi:
     """Native helpers exposed to the page as window.pywebview.api."""
 
     def __init__(self):
-        self.window = None
+        # underscore: pywebview exposes every public attribute to the page's JavaScript
+        self._window = None
 
     def pick_folder(self):
         import webview
 
-        result = self.window.create_file_dialog(webview.FileDialog.FOLDER)
+        result = self._window.create_file_dialog(webview.FileDialog.FOLDER)
         return result[0] if result else None
 
 
@@ -70,7 +72,7 @@ def run_app(port: int, browser: bool) -> None:
         else:
             print(msg)
         return
-    server = serve(port)
+    server, thread, core = serve(port)
     url = f"http://127.0.0.1:{port}/"
     if browser:
         import webbrowser
@@ -85,15 +87,31 @@ def run_app(port: int, browser: bool) -> None:
         import webview
 
         api = JsApi()
-        api.window = webview.create_window("Foresight", url, js_api=api, width=1280, height=820,
-                                           min_size=(380, 600), background_color="#F4F4F2", text_select=True)
+        window = webview.create_window("Foresight", url, js_api=api, width=1280, height=820,
+                                       min_size=(380, 600), background_color="#EFEFEC", text_select=True)
+        api._window = window
+
+        def on_closing():
+            if core.recording is None or sys.platform != "win32":
+                return True
+            import ctypes
+
+            # MB_YESNO | MB_ICONQUESTION; IDYES = 6
+            answer = ctypes.windll.user32.MessageBoxW(
+                None, "A meeting is being recorded. Stop the recording and quit?\n\n"
+                      "The audio is saved; segments not yet transcribed get up to 30 seconds to finish.",
+                "Foresight", 0x04 | 0x20)
+            return answer == 6  # returning False keeps the window open
+
+        window.events.closing += on_closing
         from . import config
 
         webview.start(private_mode=False, storage_path=str(config.data_dir() / "webview"))
+    # Finish the recording (audio files, meeting row, bounded transcription) before the
+    # interpreter exits; uvicorn's thread is a daemon and would otherwise be killed mid-write.
+    core.shutdown()
     server.should_exit = True
-    from .llama import runtime
-
-    runtime.stop()
+    thread.join(timeout=10)
 
 
 def main() -> None:

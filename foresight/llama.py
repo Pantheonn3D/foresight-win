@@ -4,6 +4,7 @@ processes, and wraps the HTTP calls the app needs (transcribe, chat, embed)."""
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import logging
 import os
@@ -32,7 +33,10 @@ CUDA = "12.4"  # 12.x runtime works with any driver from 527.41 up; 13.x needs a
 EXE = "llama-server.exe" if sys.platform == "win32" else "llama-server"
 
 
+@functools.cache
 def detect_backend() -> str:
+    """Run once per launch: nvidia-smi can take seconds on a busy GPU, and a single slow
+    call must not flip an installed CUDA setup over to Vulkan."""
     if sys.platform != "win32":
         return "cpu"
     try:
@@ -93,17 +97,18 @@ def install_runtime(progress: models.ProgressFn | None = None, cancel: threading
     b = backend()
     dest = runtime_dir(b)
     staging = dest.with_name(dest.name + ".staging")
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True)
+    # zips live outside staging so an interrupted download resumes instead of restarting
+    downloads = config.bin_dir() / "downloads"
     names = _assets(b)
     for i, name in enumerate(names):
-        z = staging / name
-        models.download_file(f"{GH}/{LLAMA_CPP_TAG}/{name}", z, 0, None,
+        models.download_file(f"{GH}/{LLAMA_CPP_TAG}/{name}", downloads / name, 0, None,
                              (lambda d, t, i=i: progress(i * 1000 + int(1000 * d / max(t, 1)), 1000 * len(names)))
                              if progress else None, cancel)
-        with zipfile.ZipFile(z) as zf:
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    for name in names:
+        with zipfile.ZipFile(downloads / name) as zf:
             zf.extractall(staging)
-        z.unlink()
     # cudart DLLs must sit beside llama-server.exe
     exe = next(staging.rglob(EXE), None)
     if exe is None:
@@ -112,7 +117,69 @@ def install_runtime(progress: models.ProgressFn | None = None, cancel: threading
         if dll.parent != exe.parent and not (exe.parent / dll.name).exists():
             shutil.move(str(dll), exe.parent / dll.name)
     shutil.rmtree(dest, ignore_errors=True)
-    staging.rename(dest)
+    # Defender scans freshly extracted binaries and briefly holds them open
+    for attempt in range(10):
+        try:
+            staging.rename(dest)
+            break
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(1)
+    for name in names:
+        (downloads / name).unlink(missing_ok=True)
+
+
+# --- child process lifetime ------------------------------------------------
+# Windows doesn't kill children when the parent dies. Without this, a crashed or
+# force-quit Foresight leaves both llama-servers holding ~9 GB of VRAM, and the next
+# launch fails with CUDA out-of-memory. Every server joins a job object that the OS
+# kills as soon as our process (and so its handle to the job) goes away.
+_job = None
+job_ok = sys.platform != "win32"
+
+
+def _attach_to_job(proc: subprocess.Popen) -> None:
+    global _job, job_ok
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if _job is None:
+            class Basic(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class Io(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_uint64) for n in ("ReadOps", "WriteOps", "OtherOps",
+                                                           "ReadBytes", "WriteBytes", "OtherBytes")]
+
+            class Extended(ctypes.Structure):
+                _fields_ = [("Basic", Basic), ("Io", Io), ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                raise ctypes.WinError(ctypes.get_last_error())
+            info = Extended()
+            info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(wintypes.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            _job = job  # never closed: the handle dies with our process, which kills the job
+        if not k32.AssignProcessToJobObject(wintypes.HANDLE(_job), wintypes.HANDLE(int(proc._handle))):
+            raise ctypes.WinError(ctypes.get_last_error())
+        job_ok = True
+    except Exception:
+        job_ok = False
+        log.exception("could not tie llama-server to Foresight's lifetime; it may outlive a crash")
 
 
 def _free_port() -> int:
@@ -137,7 +204,8 @@ class Server:
         return f"http://127.0.0.1:{self.port}"
 
     def running(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        p = self.proc  # stop() may clear it from another thread
+        return p is not None and p.poll() is None
 
     def start(self, timeout: float = 300) -> None:
         with self._lock:
@@ -151,13 +219,16 @@ class Server:
             log.info("starting %s: %s", self.name, " ".join(cmd))
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             logf = open(self.log_path, "w", encoding="utf-8", errors="replace")
-            self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=exe.parent,
-                                         creationflags=flags)
+            proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=exe.parent, creationflags=flags)
             logf.close()
+            _attach_to_job(proc)
+            self.proc = proc
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"{self.name} server exited with code {self.proc.returncode}:\n{self.tail()}")
+            if self.proc is not proc:
+                raise RuntimeError(f"{self.name} server was stopped while starting")
+            if proc.poll() is not None:
+                raise RuntimeError(f"{self.name} server exited with code {proc.returncode}:\n{self.tail()}")
             try:
                 if httpx.get(f"{self.url}/health", timeout=2).status_code == 200:
                     return
@@ -194,21 +265,47 @@ ASR_PROMPT = (
 )
 
 
+RETRY_START_AFTER = 30.0  # seconds before a failed model load is attempted again
+
+
 class Runtime:
-    """The two model servers the app uses, started lazily."""
+    """The two model servers the app uses, started lazily and restarted after a crash."""
 
     def __init__(self):
         self.llm: Server | None = None
         self.embedder: Server | None = None
         self._llm_key: str | None = None
-        self._start_lock = threading.Lock()
+        self._llm_lock = threading.Lock()
+        self._embed_lock = threading.Lock()
+        # (monotonic time, message) of the last failed start; stops every queued segment
+        # from re-triggering a 30-second model load that is going to fail again
+        self._failed: dict[str, tuple[float, str]] = {}
+        # called as on_state(kind, state, error) with kind "llm"/"embed"; set by the server
+        self.on_state = lambda kind, state, error=None: None
+
+    def _start(self, kind: str, srv: Server) -> None:
+        failed = self._failed.get(kind)
+        if failed and time.monotonic() - failed[0] < RETRY_START_AFTER:
+            raise RuntimeError(failed[1])
+        self.on_state(kind, "starting")
+        try:
+            srv.start()
+        except Exception as e:
+            self._failed[kind] = (time.monotonic(), str(e))
+            self.on_state(kind, "error", str(e))
+            raise
+        self._failed.pop(kind, None)
+        self.on_state(kind, "ready")
 
     def ensure_llm(self) -> Server:
-        with self._start_lock:
+        with self._llm_lock:
             s = config.settings()
             if self.llm and self.llm.running() and self._llm_key == s.llm:
                 return self.llm
             if self.llm:
+                if self._llm_key == s.llm:
+                    log.warning("gemma server is not running (exit code %s); restarting",
+                                self.llm.proc.returncode if self.llm.proc else None)
                 self.llm.stop()
             model = models.local_path(s.llm, "model")
             mmproj = models.local_path(s.llm, "mmproj")
@@ -220,23 +317,31 @@ class Runtime:
             if backend() == "cpu":
                 args[args.index("-ngl") + 1] = "0"
             self.llm = Server("gemma", args)
-            self.llm.start()
             self._llm_key = s.llm
+            self._start("llm", self.llm)
             return self.llm
 
     def ensure_embedder(self) -> Server:
-        with self._start_lock:
+        with self._embed_lock:
             if self.embedder and self.embedder.running():
                 return self.embedder
             model = models.local_path("embeddinggemma-2", "model")
             if model is None:
                 raise RuntimeError("EmbeddingGemma 2 is not downloaded")
-            # 2048-token context is plenty for ~1,200-character chunks
+            # 2048-token context per slot is plenty for ~1,200-character chunks
             args = ["-m", str(model), "--embeddings", "--pooling", "mean", "-c", "8192", "-np", "4",
                     "-ub", "2048", "-b", "2048", "-ngl", "all" if backend() != "cpu" else "0"]
             self.embedder = Server("embed", args)
-            self.embedder.start()
+            self._start("embed", self.embedder)
             return self.embedder
+
+    def stop_llm(self) -> None:
+        """Stop Gemma so the next call reloads it with current settings."""
+        with self._llm_lock:
+            if self.llm:
+                self.llm.stop()
+            self._failed.pop("llm", None)
+        self.on_state("llm", "stopped")
 
     def stop(self) -> None:
         for s in (self.llm, self.embedder):
@@ -259,9 +364,18 @@ class Runtime:
             "max_tokens": 400,
             "chat_template_kwargs": {"enable_thinking": False},
         }
-        r = httpx.post(f"{srv.url}/v1/chat/completions", json=body, timeout=120)
-        r.raise_for_status()
-        return (r.json()["choices"][0]["message"].get("content") or "").strip()
+        for attempt in (1, 2):
+            try:
+                r = httpx.post(f"{srv.url}/v1/chat/completions", json=body, timeout=120)
+                r.raise_for_status()
+                return (r.json()["choices"][0]["message"].get("content") or "").strip()
+            except (httpx.TransportError, httpx.HTTPStatusError) as e:
+                # a crashed server drops the connection; restart it and retry this segment once
+                if attempt == 2 or srv.running():
+                    raise
+                log.warning("gemma server died during transcription (%s); restarting", e)
+                self.on_state("llm", "error", "Gemma stopped unexpectedly; restarting")
+                srv = self.ensure_llm()
 
     def chat_stream(self, messages: list[dict], max_tokens: int = 4096, temperature: float = 0.3) -> Iterator[str]:
         srv = self.ensure_llm()
@@ -277,7 +391,11 @@ class Runtime:
                 data = line[6:]
                 if data.strip() == "[DONE]":
                     break
-                delta = json.loads(data)["choices"][0].get("delta") or {}
+                chunk = json.loads(data)
+                if "error" in chunk:
+                    err = chunk["error"]
+                    raise RuntimeError(err.get("message", str(err)) if isinstance(err, dict) else str(err))
+                delta = chunk["choices"][0].get("delta") or {}
                 if delta.get("content"):
                     yield delta["content"]
 

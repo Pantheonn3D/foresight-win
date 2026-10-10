@@ -5,7 +5,8 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 async function api(path, opts = {}) {
-  const init = { method: opts.method || (opts.body !== undefined ? "POST" : "GET"), headers: {} };
+  // the server refuses state-changing requests without this header (blocks other sites)
+  const init = { method: opts.method || (opts.body !== undefined ? "POST" : "GET"), headers: { "X-Foresight": "1" } };
   if (opts.body !== undefined && !(opts.body instanceof FormData)) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(opts.body);
@@ -67,7 +68,7 @@ const S = {
   route: { view: "home" },
   meeting: null,       // full meeting incl. lines
   tab: "mine",
-  enhancing: false,
+  enhancing: null,     // meeting id whose notes are being enhanced
   backlog: {},
   levels: {},
   elapsed: 0,
@@ -249,8 +250,8 @@ function homeView() {
     <h1 class="hero">${esc(hero)}</h1>
     <p class="lede ${rt.llm === "error" ? "error" : ""}" style="white-space:pre-wrap">${esc(lede)}</p>
     <dl class="facts">
-      <div class="fact"><dt>Your voice</dt><dd>${s.mic_device == null ? "Default microphone" : `Mic #${s.mic_device}`}</dd></div>
-      <div class="fact"><dt>Other people</dt><dd>${s.capture_system_audio ? (s.speaker_device == null ? "Default speakers (loopback)" : `Output #${s.speaker_device}`) : "Not captured"}</dd></div>
+      <div class="fact"><dt>Your voice</dt><dd>${esc(s.mic_device ?? "Default microphone")}</dd></div>
+      <div class="fact"><dt>Other people</dt><dd>${s.capture_system_audio ? esc(s.speaker_device ?? "Default speakers") : "Not captured"}</dd></div>
       <div class="fact"><dt>Language</dt><dd>${esc(s.language)}</dd></div>
       <div class="fact"><dt>Model</dt><dd>${esc(llm?.label || s.llm)} · ${esc(backend)}</dd></div>
     </dl>
@@ -332,13 +333,14 @@ function meetingHead(m) {
 function meetingView() {
   const m = S.meeting;
   const live = m.id === recId();
-  const hasEnh = !!m.enhanced || S.enhancing;
+  const enhancingThis = S.enhancing === m.id;
+  const hasEnh = !!m.enhanced || enhancingThis;
   const tab = hasEnh ? S.tab : "mine";
   const notesBody = tab === "enhanced"
-    ? `<div class="md" id="enhanced">${S.enhancing && !m.enhanced ? `<p class="muted">Reading the transcript…</p>` : mdToHtml(m.enhanced, userLineSet(m.notes))}</div>`
+    ? `<div class="md" id="enhanced">${enhancingThis && !m.enhanced ? `<p class="muted">Reading the transcript…</p>` : mdToHtml(m.enhanced, userLineSet(m.notes))}</div>`
     : `<textarea class="notes-input" id="notes" aria-label="Your notes" placeholder="Type short notes while you listen. “- budget?” or “ask Lars re: billing” is enough. Enhance turns them into full notes using the transcript.">${esc(m.notes)}</textarea>`;
   const lines = m.lines.length ? m.lines.map(lineHtml).join("") : `<p class="t-empty">${live ? "Lines appear a few seconds after someone speaks." : "No transcript."}</p>`;
-  const enhanceLabel = S.enhancing ? "Enhancing…" : m.enhanced ? "Enhance again" : "Enhance notes";
+  const enhanceLabel = enhancingThis ? "Enhancing…" : S.enhancing ? "Busy with another meeting" : m.enhanced ? "Enhance again" : "Enhance notes";
   return `<div class="meeting">
     <header class="m-head">
       <input class="title-input" id="title" value="${esc(m.title)}" aria-label="Meeting title">
@@ -351,7 +353,7 @@ function meetingView() {
           <button class="tab" role="tab" type="button" data-tab="mine" aria-selected="${tab === "mine"}">My notes</button>` : `<span class="small muted">Your notes · saved as you type</span>`}
           <span class="spacer"></span>
           ${tab === "enhanced" && m.enhanced ? `<button class="btn text" type="button" data-act="copy">Copy Markdown</button>` : ""}
-          <button class="btn ${live ? "" : "primary"}" type="button" data-act="enhance" ${S.enhancing || !m.lines.length ? "disabled" : ""}>${enhanceLabel}</button>
+          <button class="btn ${live ? "" : "primary"}" type="button" data-act="enhance" ${enhancingThis || !m.lines.length ? "disabled" : ""}>${enhanceLabel}</button>
         </div>
         <div class="sheet">${notesBody}</div>
         ${tab === "enhanced" && m.enhanced ? `<p class="legend"><b>Bold lines</b> are your own notes; the rest came from the transcript.</p>` : ""}
@@ -405,8 +407,14 @@ async function loadDevices() {
 function settingsView() {
   const s = S.st.settings;
   const devs = S.devices || [];
-  const opts = (kind, cur) => `<option value="" ${cur == null ? "selected" : ""}>Windows default</option>` +
-    devs.filter((d) => d.kind === kind).map((d) => `<option value="${d.index}" ${cur === d.index ? "selected" : ""}>${esc(d.name)}${d.default ? " (default)" : ""}</option>`).join("");
+  const opts = (kind, cur) => {
+    const list = devs.filter((d) => d.kind === kind);
+    // a saved device that is unplugged right now stays selectable instead of silently vanishing
+    const missing = cur != null && !list.some((d) => d.name === cur)
+      ? `<option value="${esc(cur)}" selected>${esc(cur)} (not connected)</option>` : "";
+    return `<option value="" ${cur == null ? "selected" : ""}>Windows default</option>` + missing +
+      list.map((d) => `<option value="${esc(d.name)}" ${cur === d.name ? "selected" : ""}>${esc(d.name)}${d.default ? " (default)" : ""}</option>`).join("");
+  };
   const llms = S.st.setup.models.filter((m) => m.role === "llm");
   return `<div class="page">
     <h1 class="hero" style="font-size:56px">Settings</h1>
@@ -417,9 +425,9 @@ function settingsView() {
       <div class="field"><label for="f-name">Your name in transcripts</label>
         <input type="text" id="f-name" data-setting="your_name" value="${esc(s.your_name)}"></div>
       <div class="field"><label for="f-mic">Microphone</label>
-        <select id="f-mic" data-setting="mic_device" data-int>${opts("input", s.mic_device)}</select></div>
+        <select id="f-mic" data-setting="mic_device" data-nullable>${opts("input", s.mic_device)}</select></div>
       <div class="field"><label for="f-spk">Capture sound from</label>
-        <select id="f-spk" data-setting="speaker_device" data-int>${opts("output", s.speaker_device)}</select>
+        <select id="f-spk" data-setting="speaker_device" data-nullable>${opts("output", s.speaker_device)}</select>
         <span class="hint">Whatever plays on this output (Teams, Zoom, Meet in a browser) is transcribed as “Others”.</span></div>
       <label class="check"><input type="checkbox" data-setting="capture_system_audio" ${s.capture_system_audio ? "checked" : ""}><span><b>Capture system audio</b><br><span class="hint">Off records only your microphone.</span></span></label>
       <label class="check"><input type="checkbox" data-setting="headphones" ${s.headphones ? "checked" : ""}><span><b>I use headphones</b><br><span class="hint">With speakers, your mic picks up the other side; Foresight removes those duplicate lines unless this is on.</span></span></label>
@@ -458,6 +466,19 @@ async function startRecording() {
   }
 }
 
+// re-render without stealing the caret from someone mid-sentence in the notes box
+function renderKeepingNotes() {
+  const ta = $("#notes");
+  if (ta && document.activeElement === ta) {
+    const { selectionStart, selectionEnd, scrollTop } = ta;
+    render();
+    const again = $("#notes");
+    if (again) { again.focus(); again.setSelectionRange(selectionStart, selectionEnd); again.scrollTop = scrollTop; }
+  } else {
+    render();
+  }
+}
+
 let saveTimer;
 function saveNotesSoon(value) {
   S.meeting.notes = value;
@@ -470,7 +491,7 @@ async function enhance() {
   const m = S.meeting;
   clearTimeout(saveTimer);
   await api(`/api/meetings/${m.id}`, { method: "PATCH", body: { notes: m.notes } });
-  S.enhancing = true;
+  S.enhancing = m.id;
   S.tab = "enhanced";
   const previous = m.enhanced;
   m.enhanced = "";
@@ -484,14 +505,14 @@ async function enhance() {
       if (done) break;
       m.enhanced += dec.decode(value, { stream: true });
       const el = $("#enhanced");
-      if (el && S.meeting === m) el.innerHTML = mdToHtml(m.enhanced, userLineSet(m.notes));
+      if (el && S.meeting && S.meeting.id === m.id) el.innerHTML = mdToHtml(m.enhanced, userLineSet(m.notes));
     }
   } catch (e) {
     m.enhanced = previous;
     toast(e.message, true);
   }
-  S.enhancing = false;
-  if (S.meeting === m) render();
+  S.enhancing = null;
+  if (S.meeting && S.meeting.id === m.id) render();
   refreshMeetings();
 }
 
@@ -602,7 +623,7 @@ document.addEventListener("change", async (ev) => {
   }
   if (t.dataset.setting) {
     let v = t.type === "checkbox" ? t.checked : t.value;
-    if (t.dataset.int !== undefined) v = v === "" ? null : Number(v);
+    if (t.dataset.nullable !== undefined && v === "") v = null;
     return saveSetting(t.dataset.setting, v);
   }
   if (t.id === "title") {
@@ -621,8 +642,9 @@ document.addEventListener("keydown", (ev) => {
 });
 
 document.addEventListener("submit", async (ev) => {
-  ev.preventDefault();
   const form = ev.target;
+  if (form.method === "dialog") return; // let <dialog> forms close with their button's value
+  ev.preventDefault();
   const kind = form.dataset.form;
   if (kind === "ask") {
     const q = form.q.value.trim();
@@ -662,8 +684,16 @@ document.addEventListener("submit", async (ev) => {
 window.addEventListener("hashchange", route);
 
 // ---------- live events ----------
+let everConnected = false;
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/api/events`);
+  ws.onopen = async () => {
+    // events sent while disconnected are gone; reload state instead of trusting what we have
+    if (everConnected) {
+      try { await refreshState(); await refreshMeetings(); if (S.enhancing == null) await route(); } catch { /* retried on next reconnect */ }
+    }
+    everConnected = true;
+  };
   ws.onmessage = (e) => handle(JSON.parse(e.data));
   ws.onclose = () => setTimeout(connect, 1000);
 }
@@ -716,13 +746,16 @@ async function handle(ev) {
       await refreshState();
       await refreshMeetings();
       if (cur && cur.id === ev.meeting_id && ev.state === "done") {
-        S.meeting = await api(`/api/meetings/${cur.id}`);
-        if (!S.enhancing) render();
-      } else if (S.route.view === "meeting" && !S.enhancing && document.activeElement?.id !== "notes") {
-        render();
+        const fresh = await api(`/api/meetings/${cur.id}`);
+        // the local copy has keystrokes the debounced save hasn't sent yet
+        S.meeting = { ...fresh, notes: cur.notes, enhanced: S.enhancing === cur.id ? cur.enhanced : fresh.enhanced };
+        if (S.enhancing !== cur.id) renderKeepingNotes();
+      } else if (S.route.view === "meeting" && S.enhancing !== S.meeting?.id) {
+        renderKeepingNotes();
       }
       break;
-    case "setup":
+    case "setup": {
+      const prev = S.st.setup.progress || {};
       S.st.setup.progress = ev;
       if (ev.finished) {
         await refreshState();
@@ -730,27 +763,48 @@ async function handle(ev) {
         S.sizes = null;
         go("#/");
       } else if (S.route.view === "setup") {
-        render();
+        // only rebuild when the step changes; byte counts update in place so the
+        // Cancel button isn't replaced under the pointer mid-click
+        const bar = $(".progress .bar > i");
+        if (bar && ev.running && prev.running && ev.step === prev.step) {
+          const pct = ev.total ? Math.min(100, (100 * ev.done) / ev.total) : 0;
+          bar.style.width = `${pct}%`;
+          bar.parentElement.setAttribute("aria-valuenow", pct.toFixed(0));
+          const nums = $(".progress .row .num");
+          if (nums) nums.textContent = ev.total ? `${gb(ev.done)} of ${gb(ev.total)}` : "connecting…";
+        } else {
+          render();
+        }
       }
       break;
+    }
     case "runtime":
       S.st.runtime = { llm: ev.llm, embed: ev.embed, error: ev.error };
       if (ev.llm === "error") toast(`Gemma didn't start: ${String(ev.error).split("\n")[0]}`, true);
       if (S.route.view === "home") render();
       break;
-    case "kb_progress":
+    case "kb_progress": {
       S.kbProgress = ev;
-      if (ev.done === ev.total) { await refreshState(); }
-      if (S.route.view === "ask") {
-        const el = $("#kbStatus");
-        if (el) render();
+      if (ev.done === ev.total) await refreshState();
+      const el = $("#kbStatus");
+      // update the status line only; re-rendering would wipe a half-typed question
+      if (el && S.route.view === "ask") {
+        el.textContent = ev.done < ev.total
+          ? `Indexing ${ev.done + 1} of ${ev.total}: ${ev.current || ""}. Searches include these folders and every meeting.`
+          : `${S.st.kb.files.toLocaleString()} files · ${S.st.kb.chunks.toLocaleString()} passages indexed. Searches include these folders and every meeting.`;
       }
       break;
+    }
     case "error":
-      toast(`${ev.where === "import" ? "Import" : "Transcription"} error: ${ev.message}`, true);
+      toast(ev.where === "microphone" ? ev.message : `${ev.where === "import" ? "Import" : "Transcription"} error: ${ev.message}`, true);
       break;
   }
 }
+
+// any action whose request fails without its own handler still tells the user why
+window.addEventListener("unhandledrejection", (e) => {
+  toast(e.reason?.message || String(e.reason), true);
+});
 
 // ---------- boot ----------
 (async function boot() {

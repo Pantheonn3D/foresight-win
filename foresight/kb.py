@@ -15,7 +15,7 @@ from . import config, models
 from .db import DB
 from .events import bus
 from .llama import runtime
-from .notes import transcript_text
+from .notes import chars_per_token, transcript_text
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ CHUNK_CHARS = 1200
 OVERLAP_CHARS = 200
 BATCH = 16
 QUERY_PREFIX = "task: search result | query: "
-MEETING_CONTEXT_CHARS = 80000  # ~23k tokens; a context slot holds 32k
+MEETING_CONTEXT_TOKENS = 23000  # a context slot holds 32k; leaves room for the question and answer
 
 
 def doc_prefix(title: str) -> str:
@@ -111,6 +111,7 @@ class Index:
         self._meta: list[dict] | None = None
         self._mat: np.ndarray | None = None
         self.indexing = False
+        self._scan_lock = threading.Lock()
 
     def _invalidate(self) -> None:
         self._meta = self._mat = None
@@ -140,8 +141,8 @@ class Index:
 
     def scan(self) -> None:
         """Index new or changed files in linked folders; drop files that disappeared."""
-        if self.indexing or not available():
-            return
+        if not available() or not self._scan_lock.acquire(blocking=False):
+            return  # a scan is already running; it will pick up the latest folder list next time
         self.indexing = True
         try:
             folders = [Path(f) for f in config.settings().folders]
@@ -184,6 +185,7 @@ class Index:
             bus.publish("kb_progress", done=len(todo), total=len(todo), current=None)
         finally:
             self.indexing = False
+            self._scan_lock.release()
 
     def search(self, query: str, k: int = 8, refs: set[str] | None = None) -> list[dict]:
         with self._lock:
@@ -223,13 +225,14 @@ def ask(index: Index, db: DB, question: str, meeting_id: str | None = None) -> t
         notes = m["enhanced"] or m["notes"]
         text = (f"Notes:\n{notes}\n\n" if notes else "") + f"Transcript:\n{body}"
         ref = f"meeting:{meeting_id}"
-        if len(text) > MEETING_CONTEXT_CHARS and available():
+        limit = int(MEETING_CONTEXT_TOKENS * chars_per_token(m["language"]))
+        if len(text) > limit and available():
             # too long for one context slot: retrieve the relevant parts of this meeting only
             if m["status"] == "done" and not db.kb_has(ref):
                 index.index_meeting(meeting_id)
             sources = index.search(question, k=12, refs={ref})
         else:
-            sources = [{"ref": ref, "title": m["title"], "text": text[-MEETING_CONTEXT_CHARS:]}]
+            sources = [{"ref": ref, "title": m["title"], "text": text[-limit:]}]
     else:
         if not available():
             raise RuntimeError("EmbeddingGemma 2 is not downloaded, so linked folders can't be searched")

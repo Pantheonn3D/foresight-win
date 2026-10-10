@@ -17,7 +17,7 @@ def client(fake_runtime, monkeypatch):
     monkeypatch.setattr(models, "is_installed", lambda key: True)
     monkeypatch.setattr(kb, "available", lambda: True)
     monkeypatch.setattr(server.App, "warm", lambda self: None)
-    with TestClient(server.create_app()) as c:
+    with TestClient(server.create_app(), headers={"x-foresight": "1"}) as c:
         yield c
 
 
@@ -92,3 +92,36 @@ def test_open_path_is_limited_to_linked_folders(client, tmp_path):
     secret = tmp_path / "elsewhere.txt"
     secret.write_text("x")
     assert client.post("/api/open", json={"path": str(secret)}).status_code == 403
+
+
+def test_cross_site_requests_are_refused(client):
+    # a page on another site can send a simple POST, but not one with a custom header
+    r = client.post("/api/recording/start", headers={"x-foresight": ""})
+    assert r.status_code == 403
+    assert client.get("/api/state", headers={"host": "evil.example"}).status_code == 400
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/api/events", headers={"origin": "https://evil.example"}) as ws:
+            ws.receive_text()
+
+
+def test_delete_refused_while_transcribing(client, fake_runtime):
+    from foresight import db as dbmod, session
+    from foresight.audio.segmenter import Segment
+
+    _, script = fake_runtime
+    gate = __import__("threading").Event()
+    orig = llama.runtime.transcribe
+    llama.runtime.transcribe = lambda wav, lang: (gate.wait(5), "hello there")[1]
+    try:
+        d = dbmod.DB()
+        mid = d.create_meeting("busy", "done", "English")
+        t = session.Transcriber(d, mid, "English", dedupe_echo=False)
+        t.submit("file", Segment(0, 1, np.zeros(SR, dtype=np.float32)))
+        assert client.delete(f"/api/meetings/{mid}").status_code == 409
+        gate.set()
+        t.finish(5)
+        assert client.delete(f"/api/meetings/{mid}").status_code == 200
+    finally:
+        llama.runtime.transcribe = orig

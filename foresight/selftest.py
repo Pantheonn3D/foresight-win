@@ -39,6 +39,17 @@ def run(llm: str, wav: str, expect: str, skip_embed: bool, backend: str = "auto"
     t = _step("start Gemma server")
     llama.runtime.ensure_llm()
     print(f"ready ({time.monotonic() - t:.0f}s)")
+    import sys
+
+    if sys.platform == "win32":
+        import ctypes
+
+        in_job = ctypes.c_int(0)
+        ctypes.windll.kernel32.IsProcessInJob(ctypes.c_void_p(int(llama.runtime.llm.proc._handle)), None,
+                                              ctypes.byref(in_job))
+        print(f"llama-server tied to app lifetime (job object): {bool(in_job.value) and llama.job_ok}")
+        if not (in_job.value and llama.job_ok):
+            failures.append("llama-server is not in the kill-on-close job object")
 
     t = _step("transcribe")
     audio = decode_file(Path(wav))

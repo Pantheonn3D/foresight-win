@@ -115,6 +115,9 @@ def load_manifest() -> dict:
     return {}
 
 
+_manifest_lock = threading.Lock()
+
+
 def _save_manifest(m: dict) -> None:
     p = _manifest_path()
     tmp = p.with_suffix(".tmp")
@@ -124,9 +127,8 @@ def _save_manifest(m: dict) -> None:
 
 def resolve(key: str) -> dict:
     """Return {"model": {...}, "mmproj": {...}|None} for a catalog key, querying HF if needed."""
-    manifest = load_manifest()
-    if key in manifest:
-        return manifest[key]
+    if key in (cached := load_manifest()):
+        return cached[key]
     spec = CATALOG[key]
     files = list_repo(spec.repo)
     main = pick(files, spec.patterns, exclude_mmproj=True)
@@ -138,8 +140,11 @@ def resolve(key: str) -> dict:
         if mm is None:
             raise RuntimeError(f"No mmproj (audio encoder) file found in {spec.repo}")
         entry["mmproj"] = vars(mm)
-    manifest[key] = entry
-    _save_manifest(manifest)
+    # resolves for different models can run at once (setup sizes); merge under a lock
+    with _manifest_lock:
+        manifest = load_manifest()
+        manifest[key] = entry
+        _save_manifest(manifest)
     return entry
 
 
