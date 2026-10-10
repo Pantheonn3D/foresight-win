@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foresight</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="rail" id="rail">
+    <div class="brand">
+      <span class="wordmark">Foresight</span>
+      <span class="descriptor">offline meeting notes</span>
+    </div>
+    <button class="btn primary record" id="recordBtn" type="button"><span class="dot" aria-hidden="true"></span><span id="recordLabel">Start recording</span></button>
+    <nav class="nav" aria-label="Main">
+      <button type="button" class="nav-item" data-view="ask">Ask your files</button>
+      <button type="button" class="nav-item" data-view="settings">Settings</button>
+    </nav>
+    <div class="meetings" id="meetingList" aria-label="Meetings"></div>
+  </aside>
+  <main class="main" id="main" tabindex="-1"></main>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="importInput" accept="audio/*,video/*,.m4a,.mp3,.wav,.flac,.ogg,.opus,.webm,.mp4,.mkv,.mov" hidden>
+<script src="app.js"></script>
+</body>
+</html>

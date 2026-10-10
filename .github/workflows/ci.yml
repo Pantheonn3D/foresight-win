@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run pytest -q
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - name: Freeze with PyInstaller
+        run: uv run pyinstaller packaging/foresight.spec --noconfirm
+      - name: Smoke-test the frozen app
+        shell: pwsh
+        run: |
+          $env:FORESIGHT_HOME = "$env:RUNNER_TEMP\fh-smoke"
+          $p = Start-Process dist\Foresight\Foresight.exe -ArgumentList "--browser","--port","47900" -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $s = Invoke-RestMethod http://127.0.0.1:47900/api/state
+              $html = Invoke-WebRequest http://127.0.0.1:47900/ -UseBasicParsing
+              $devices = Invoke-RestMethod http://127.0.0.1:47900/api/devices
+              Write-Host "backend=$($s.setup.backend) audio devices=$($devices.Count) page=$($html.StatusCode)"
+              $ok = $true; break
+            } catch { }
+          }
+          Stop-Process -Id $p.Id -Force
+          Get-Content "$env:FORESIGHT_HOME\logs\foresight.log" -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "frozen app did not serve /api/state" }
+      - name: Build installer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" packaging\installer.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Foresight-Setup
+          path: dist/Foresight-Setup-*.exe
+          if-no-files-found: error
+
+  # Real llama.cpp + real Gemma 4 weights + real speech, on CPU (runners have no GPU).
+  selftest:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      FORESIGHT_HOME: D:\fh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - name: What Hugging Face hosts
+        run: uv run python scripts/probe_hf.py
+      - uses: actions/cache@v4
+        with:
+          path: D:\fh\models
+          key: models-e2b-${{ hashFiles('foresight/models.py') }}
+      - name: Synthesize test speech
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Speech
+          $s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $s.Rate = -1
+          $s.SetOutputToWaveFile("D:\speech.wav")
+          $s.Speak("The marketing budget for the third quarter is forty two thousand euros.")
+          $s.Speak("We will ship the release on Thursday, and Lars will recruit six participants for the usability test.")
+          $s.Dispose()
+          Get-Item D:\speech.wav
+      - name: End-to-end self-test
+        run: >
+          uv run python -m foresight --verbose selftest --backend cpu --llm gemma-4-e2b --wav D:\speech.wav
+          --expect "marketing budget third quarter thousand euros ship release Thursday Lars recruit participants usability test"
+      - name: llama-server logs
+        if: always()
+        shell: pwsh
+        run: Get-ChildItem D:\fh\logs -ErrorAction SilentlyContinue | ForEach-Object { "---- $($_.Name)"; Get-Content $_.FullName -Tail 60 }
