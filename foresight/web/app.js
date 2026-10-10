@@ -49,6 +49,17 @@ function toast(msg, bad = false) {
   toastTimer = setTimeout(() => (t.className = "toast"), bad ? 7000 : 3500);
 }
 
+function ask(title, body, okLabel) {
+  const d = $("#dialog");
+  $("#dialogTitle").textContent = title;
+  $("#dialogBody").textContent = body;
+  $("#dialogOk").textContent = okLabel;
+  d.returnValue = "";
+  d.showModal();
+  d.querySelector('[value="cancel"]').focus();
+  return new Promise((resolve) => d.addEventListener("close", () => resolve(d.returnValue === "ok"), { once: true }));
+}
+
 // ---------- state ----------
 const S = {
   st: null,            // /api/state
@@ -417,7 +428,7 @@ function settingsView() {
         <select id="f-llm" data-setting="llm">${llms.map((m) => `<option value="${m.key}" ${m.key === s.llm ? "selected" : ""} ${m.installed ? "" : "disabled"}>${esc(m.label)}${m.installed ? "" : " (not downloaded)"}</option>`).join("")}</select>
         <span class="hint"><button class="link" type="button" data-act="goto-setup">Download models</button></span></div>
       <div class="field"><label for="f-backend">GPU backend</label>
-        <select id="f-backend" data-setting="backend">${["auto", "cuda", "vulkan", "cpu"].map((b) => `<option ${b === s.backend ? "selected" : ""}>${b}</option>`).join("")}</select>
+        <select id="f-backend" data-setting="backend">${[["auto", "Automatic"], ["cuda", "NVIDIA (CUDA)"], ["vulkan", "AMD or Intel (Vulkan)"], ["cpu", "CPU only (slow)"]].map(([v, l]) => `<option value="${v}" ${v === s.backend ? "selected" : ""}>${l}</option>`).join("")}</select>
         <span class="hint">Auto uses CUDA on NVIDIA cards. Changing it downloads that llama.cpp build.</span></div>
       <div class="field"><span class="label">Data folder</span><span class="small" style="word-break:break-all">${esc(S.st.data_dir)}</span>
         <span class="hint">Meetings, audio, models and the search index. Delete it to remove everything.</span></div>
@@ -552,7 +563,7 @@ document.addEventListener("click", async (ev) => {
     return toast("Copied as Markdown");
   }
   if (act === "delete-meeting") {
-    if (!confirm(`Delete “${S.meeting.title}” with its transcript and audio? This can't be undone.`)) return;
+    if (!(await ask(`Delete “${S.meeting.title}”?`, "Its notes, transcript and audio are removed from this PC. This can't be undone.", "Delete meeting"))) return;
     await api(`/api/meetings/${S.meeting.id}`, { method: "DELETE" });
     await refreshMeetings();
     return go("#/");
